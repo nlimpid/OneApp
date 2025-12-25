@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_BUNDLE_VERSION: "0.6.0"
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: oneapp
+            artifact: oneapp-ubuntu.tar.gz
+          - os: windows-latest
+            bin: oneapp.exe
+            artifact: oneapp-windows.zip
+          - os: macos-latest
+            bin: oneapp
+            artifact: oneapp-macos-arm64.tar.gz
+            app_artifact: OneApp-macos-arm64.app.zip
+          - os: macos-13
+            bin: oneapp
+            artifact: oneapp-macos-x86_64.tar.gz
+            app_artifact: OneApp-macos-x86_64.app.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libasound2-dev \
+            libudev-dev
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Cache cargo-bundle (macOS)
+        if: startsWith(matrix.os, 'macos')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-bundle-${{ env.CARGO_BUNDLE_VERSION }}
+
+      - name: Install cargo-bundle (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          if ! command -v cargo-bundle >/dev/null 2>&1; then
+            cargo install cargo-bundle --version "${CARGO_BUNDLE_VERSION}" --locked
+          fi
+
+      - name: Bundle (.app, macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: cargo bundle --release
+
+      - name: Import signing certificate (macOS)
+        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != ''
+        env:
+          MACOS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$MACOS_SIGNING_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+
+      - name: Codesign (.app, macOS)
+        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != ''
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "target/bundle/osx/OneApp.app"
+          codesign --verify --deep --strict --verbose=2 "target/bundle/osx/OneApp.app"
+
+      - name: Notarize (.app, macOS)
+        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          mkdir -p dist
+          xcrun notarytool store-credentials "notarytool-profile" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD"
+          ditto -c -k --sequesterRsrc --keepParent "target/bundle/osx/OneApp.app" "dist/notarize.zip"
+          xcrun notarytool submit "dist/notarize.zip" --keychain-profile "notarytool-profile" --wait
+          xcrun stapler staple "target/bundle/osx/OneApp.app"
+          rm -f "dist/notarize.zip"
+
+      - name: Ensure lockfile unchanged
+        run: git diff --exit-code Cargo.lock
+
+      - name: Package (.app, macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "target/bundle/osx/OneApp.app" "dist/${{ matrix.app_artifact }}"
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.artifact }}" -C target/release "${{ matrix.bin }}"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target\release\${{ matrix.bin }} -DestinationPath dist\${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oneapp-${{ matrix.os }}
+          path: dist/*
+
+  github-release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Generate checksums
+        run: |
+          cd dist
+          find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*

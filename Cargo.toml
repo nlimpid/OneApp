@@ -2,6 +2,16 @@
 name = "oneapp"
 version = "0.1.0"
 edition = "2021"
+publish = false
+description = "A GPUI-based desktop Hacker News client."
+license = "MIT"
+readme = "README.md"
+
+[package.metadata.bundle]
+name = "OneApp"
+identifier = "com.nlimpid.oneapp"
+category = "public.app-category.news"
+short_description = "A GPUI-based desktop Hacker News client."
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "v0.168.2" }
