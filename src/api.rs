@@ -1,7 +1,8 @@
 use crate::models::{Comment, RawComment, Story};
-use futures::future::join_all;
-use smol::unblock;
+use futures::{future::join_all, AsyncReadExt as _};
+use gpui::http_client::{AsyncBody, HttpClient};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const BASE_URL: &str = "https://hacker-news.firebaseio.com/v0";
 const MAX_COMMENT_DEPTH: usize = 3;
@@ -9,44 +10,48 @@ const MAX_COMMENTS_PER_LEVEL: usize = 10;
 
 #[derive(Clone)]
 pub struct HackerNewsClient {
-    client: reqwest::blocking::Client,
-}
-
-impl Default for HackerNewsClient {
-    fn default() -> Self {
-        Self::new()
-    }
+    client: Arc<dyn HttpClient>,
 }
 
 impl HackerNewsClient {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::blocking::Client::new(),
+    pub fn new(client: Arc<dyn HttpClient>) -> Self {
+        Self { client }
+    }
+
+    async fn get_json<T>(&self, url: &str) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let response = self
+            .client
+            .get(url, AsyncBody::empty(), true)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!("HTTP {} for {}", response.status(), url));
         }
+
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
     }
 
     async fn fetch_item<T>(&self, id: i64) -> Option<T>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
-        let client = self.client.clone();
         let url = format!("{}/item/{}.json", BASE_URL, id);
-
-        unblock(move || client.get(url).send().ok()?.json::<T>().ok()).await
+        self.get_json(&url).await.ok()
     }
 
     pub async fn fetch_top_stories(&self, limit: usize) -> Result<Vec<Story>, String> {
-        let client = self.client.clone();
         let url = format!("{}/topstories.json", BASE_URL);
-        let ids: Vec<i64> = unblock(move || {
-            client
-                .get(url)
-                .send()
-                .map_err(|e| e.to_string())?
-                .json::<Vec<i64>>()
-                .map_err(|e| e.to_string())
-        })
-        .await?;
+        let ids: Vec<i64> = self.get_json(&url).await?;
 
         let ids: Vec<i64> = ids.into_iter().take(limit).collect();
 

@@ -10,6 +10,7 @@ use gpui::{
     ViewContext, WeakView, WindowBounds, WindowOptions,
 };
 use models::{Comment, NewsChannel, Story};
+use reqwest_client::ReqwestClient;
 use std::collections::HashSet;
 use std::sync::Arc;
 use theme::Theme;
@@ -35,6 +36,7 @@ struct AppState {
 impl AppState {
     fn new(cx: &mut ViewContext<Self>) -> Self {
         let focus_handle = cx.focus_handle();
+        let http_client = cx.app().http_client();
         Self {
             theme: Theme::default(),
             stories: Vec::new(),
@@ -45,7 +47,7 @@ impl AppState {
             is_loading_comments: false,
             error_message: None,
             selected_channel: NewsChannel::HackerNews,
-            client: Arc::new(HackerNewsClient::new()),
+            client: Arc::new(HackerNewsClient::new(http_client)),
             focus_handle,
         }
     }
@@ -717,28 +719,30 @@ impl AppState {
 }
 
 fn main() {
-    App::new().run(|cx: &mut AppContext| {
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1200.), px(800.)),
-                cx,
-            ))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("OneRss".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(12.))),
-            }),
-            ..Default::default()
-        };
+    App::new()
+        .with_http_client(Arc::new(ReqwestClient::new()))
+        .run(|cx: &mut AppContext| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1200.), px(800.)),
+                    cx,
+                ))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("OneRss".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(12.))),
+                }),
+                ..Default::default()
+            };
 
-        cx.open_window(options, |cx| {
-            cx.new_view(|cx| {
-                let mut state = AppState::new(cx);
-                state.load_stories(cx);
-                state
+            cx.open_window(options, |cx| {
+                cx.new_view(|cx| {
+                    let mut state = AppState::new(cx);
+                    state.load_stories(cx);
+                    state
+                })
             })
-        })
-        .unwrap();
-    });
+            .unwrap();
+        });
 }
