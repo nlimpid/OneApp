@@ -1,5 +1,6 @@
 use gpui::{hsla, Hsla};
 
+#[allow(dead_code)]
 pub struct Theme {
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
