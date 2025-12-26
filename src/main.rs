@@ -5,9 +5,10 @@ mod theme;
 use api::HackerNewsClient;
 use gpui::prelude::*;
 use gpui::{
-    div, hsla, point, px, rems, size, App, AppContext, AsyncWindowContext, Bounds, Div,
-    ElementId, FocusHandle, FontWeight, Hsla, IntoElement, Render, Stateful, TitlebarOptions,
-    ViewContext, WeakView, WindowBounds, WindowOptions,
+    div, hsla, point, px, rems, size, App, AppContext, AsyncWindowContext, Bounds, Div, ElementId,
+    FocusHandle, FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, Stateful, TitlebarOptions, ViewContext, WeakView, WindowBounds,
+    WindowOptions,
 };
 use models::{Comment, NewsChannel, Story};
 use reqwest_client::ReqwestClient;
@@ -17,6 +18,11 @@ use theme::Theme;
 
 /// macOS traffic light 按钮区域的高度
 const TITLEBAR_HEIGHT: f32 = 38.0;
+const SIDEBAR_WIDTH: f32 = 56.0;
+const STORY_LIST_DEFAULT_WIDTH: f32 = 360.0;
+const STORY_LIST_MIN_WIDTH: f32 = 240.0;
+const STORY_LIST_MIN_DETAIL_WIDTH: f32 = 360.0;
+const SPLITTER_WIDTH: f32 = 8.0;
 
 // Application State
 struct AppState {
@@ -31,6 +37,10 @@ struct AppState {
     selected_channel: NewsChannel,
     client: Arc<HackerNewsClient>,
     focus_handle: FocusHandle,
+    story_list_width: f32,
+    is_resizing_story_list: bool,
+    resize_start_x: f32,
+    resize_start_width: f32,
 }
 
 impl AppState {
@@ -49,6 +59,10 @@ impl AppState {
             selected_channel: NewsChannel::HackerNews,
             client: Arc::new(HackerNewsClient::new(http_client)),
             focus_handle,
+            story_list_width: STORY_LIST_DEFAULT_WIDTH,
+            is_resizing_story_list: false,
+            resize_start_x: 0.0,
+            resize_start_width: STORY_LIST_DEFAULT_WIDTH,
         }
     }
 
@@ -70,30 +84,26 @@ impl AppState {
         self.collapsed_comments.contains(&comment_id)
     }
 
-    /// 检查评论是否应该被隐藏（因为其父评论被折叠）
-    fn is_hidden_by_parent(&self, comment: &Comment) -> bool {
-        // 找到所有深度小于当前评论的评论，检查它们是否被折叠
-        for c in &self.comments {
-            if c.depth < comment.depth && self.collapsed_comments.contains(&c.id) {
-                // 检查 comment 是否是 c 的后代
-                // 简单实现：如果 c 在 comments 列表中出现在 comment 之前，
-                // 且 c 的深度小于 comment，则认为 comment 是 c 的后代
-                let c_idx = self.comments.iter().position(|x| x.id == c.id);
-                let comment_idx = self.comments.iter().position(|x| x.id == comment.id);
-                if let (Some(ci), Some(coi)) = (c_idx, comment_idx) {
-                    if ci < coi {
-                        // 检查在 c 和 comment 之间是否所有评论的深度都大于 c
-                        let is_descendant = self.comments[ci + 1..coi]
-                            .iter()
-                            .all(|x| x.depth > c.depth);
-                        if is_descendant {
-                            return true;
-                        }
-                    }
+    fn visible_comments(&self) -> Vec<&Comment> {
+        let mut visible = Vec::new();
+        let mut skip_until_depth: Option<usize> = None;
+
+        for comment in &self.comments {
+            if let Some(depth) = skip_until_depth {
+                if comment.depth > depth {
+                    continue;
                 }
+                skip_until_depth = None;
+            }
+
+            visible.push(comment);
+
+            if self.is_collapsed(comment.id) {
+                skip_until_depth = Some(comment.depth);
             }
         }
-        false
+
+        visible
     }
 
     fn load_stories(&mut self, cx: &mut ViewContext<Self>) {
@@ -103,22 +113,24 @@ impl AppState {
 
         let client = self.client.clone();
 
-        cx.spawn(|this: WeakView<Self>, mut cx: AsyncWindowContext| async move {
-            let result = client.fetch_top_stories(30).await;
-            let _ = this.update(&mut cx, |this: &mut Self, cx: &mut ViewContext<Self>| {
-                match result {
-                    Ok(stories) => {
-                        this.stories = stories;
-                        this.error_message = None;
+        cx.spawn(
+            |this: WeakView<Self>, mut cx: AsyncWindowContext| async move {
+                let result = client.fetch_top_stories(30).await;
+                let _ = this.update(&mut cx, |this: &mut Self, cx: &mut ViewContext<Self>| {
+                    match result {
+                        Ok(stories) => {
+                            this.stories = stories;
+                            this.error_message = None;
+                        }
+                        Err(e) => {
+                            this.error_message = Some(format!("Failed to load stories: {}", e));
+                        }
                     }
-                    Err(e) => {
-                        this.error_message = Some(format!("Failed to load stories: {}", e));
-                    }
-                }
-                this.is_loading = false;
-                cx.notify();
-            });
-        })
+                    this.is_loading = false;
+                    cx.notify();
+                });
+            },
+        )
         .detach();
     }
 
@@ -134,22 +146,62 @@ impl AppState {
 
             let client = self.client.clone();
 
-            cx.spawn(|this: WeakView<Self>, mut cx: AsyncWindowContext| async move {
-                let result = client.fetch_comments(&story).await;
-                let _ = this.update(&mut cx, |this: &mut Self, cx: &mut ViewContext<Self>| {
-                    match result {
-                        Ok(comments) => {
-                            this.comments = comments;
+            cx.spawn(
+                |this: WeakView<Self>, mut cx: AsyncWindowContext| async move {
+                    let result = client.fetch_comments(&story).await;
+                    let _ = this.update(&mut cx, |this: &mut Self, cx: &mut ViewContext<Self>| {
+                        match result {
+                            Ok(comments) => {
+                                this.comments = comments;
+                            }
+                            Err(e) => {
+                                this.error_message =
+                                    Some(format!("Failed to load comments: {}", e));
+                            }
                         }
-                        Err(e) => {
-                            this.error_message = Some(format!("Failed to load comments: {}", e));
-                        }
-                    }
-                    this.is_loading_comments = false;
-                    cx.notify();
-                });
-            })
+                        this.is_loading_comments = false;
+                        cx.notify();
+                    });
+                },
+            )
             .detach();
+        }
+    }
+
+    fn start_story_list_resize(&mut self, event: &MouseDownEvent, cx: &mut ViewContext<Self>) {
+        if event.click_count >= 2 {
+            self.story_list_width = STORY_LIST_DEFAULT_WIDTH;
+            self.is_resizing_story_list = false;
+            cx.notify();
+            return;
+        }
+
+        self.is_resizing_story_list = true;
+        self.resize_start_x = event.position.x.0;
+        self.resize_start_width = self.story_list_width;
+        cx.notify();
+    }
+
+    fn update_story_list_resize(&mut self, event: &MouseMoveEvent, cx: &mut ViewContext<Self>) {
+        if !self.is_resizing_story_list {
+            return;
+        }
+
+        let delta = event.position.x.0 - self.resize_start_x;
+        let viewport_width = cx.window_context().viewport_size().width.0;
+        let max_by_window =
+            (viewport_width - SIDEBAR_WIDTH - SPLITTER_WIDTH - STORY_LIST_MIN_DETAIL_WIDTH)
+                .max(STORY_LIST_MIN_WIDTH);
+
+        self.story_list_width =
+            (self.resize_start_width + delta).clamp(STORY_LIST_MIN_WIDTH, max_by_window);
+        cx.notify();
+    }
+
+    fn stop_story_list_resize(&mut self, _: &MouseUpEvent, cx: &mut ViewContext<Self>) {
+        if self.is_resizing_story_list {
+            self.is_resizing_story_list = false;
+            cx.notify();
         }
     }
 }
@@ -166,10 +218,14 @@ impl Render for AppState {
             .text_color(theme.text_primary)
             .font_family(".SystemUIFont")
             .track_focus(&self.focus_handle)
+            .on_mouse_move(cx.listener(Self::update_story_list_resize))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_story_list_resize))
             // Sidebar
             .child(self.render_sidebar())
             // Story List
             .child(self.render_story_list(cx))
+            // Splitter
+            .child(self.render_story_splitter(cx))
             // Detail Panel
             .child(self.render_detail_panel(cx))
     }
@@ -180,7 +236,7 @@ impl AppState {
         let theme = &self.theme;
 
         div()
-            .w(px(56.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex()
             .flex_col()
@@ -212,13 +268,12 @@ impl AppState {
         let theme = &self.theme;
 
         div()
-            .w(px(360.))
+            .w(px(self.story_list_width))
+            .flex_shrink()
             .h_full()
             .flex()
             .flex_col()
             .bg(theme.bg_secondary)
-            .border_r_1()
-            .border_color(theme.border_subtle)
             // Header with titlebar spacing
             .child(
                 div()
@@ -232,17 +287,12 @@ impl AppState {
                     .child(div().h(px(TITLEBAR_HEIGHT)).w_full().flex_shrink_0())
                     // Title
                     .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .px_4()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.selected_channel.name()),
-                            ),
+                        div().flex_1().flex().items_center().px_4().child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.selected_channel.name()),
+                        ),
                     ),
             )
             // Error message
@@ -275,17 +325,93 @@ impl AppState {
             )
     }
 
+    fn render_story_splitter(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let is_resizing = self.is_resizing_story_list;
+        let divider_color = if is_resizing {
+            theme.border
+        } else {
+            theme.border_subtle
+        };
+
+        div()
+            .id("story-splitter")
+            .w(px(SPLITTER_WIDTH))
+            .h_full()
+            .flex()
+            .flex_row()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::start_story_list_resize),
+            )
+            // Left half blends with story list background; right half blends with detail background.
+            .child(div().flex_1().h_full().bg(theme.bg_secondary))
+            .child(div().w(px(1.)).h_full().bg(divider_color))
+            .child(div().flex_1().h_full().bg(theme.bg_primary))
+    }
+
     fn render_loading_indicator(&self) -> impl IntoElement {
         let theme = &self.theme;
+
+        let skeleton_bar = |max_w: f32, h: f32| {
+            div()
+                .h(px(h))
+                .w_full()
+                .max_w(px(max_w))
+                .rounded(px(3.))
+                .bg(theme.bg_tertiary)
+        };
+
+        let placeholders: Vec<_> = (0..10)
+            .map(|i| {
+                let title_max_w = match i % 3 {
+                    0 => 280.0,
+                    1 => 240.0,
+                    _ => 200.0,
+                };
+
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border_subtle)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(skeleton_bar(title_max_w, 14.0))
+                            .child(div().w_full().flex().gap_2().children(vec![
+                                skeleton_bar(96.0, 10.0).into_any_element(),
+                                skeleton_bar(72.0, 10.0).into_any_element(),
+                                skeleton_bar(56.0, 10.0).into_any_element(),
+                            ])),
+                    )
+                    .into_any_element()
+            })
+            .collect();
 
         div()
             .w_full()
             .h_full()
             .flex()
-            .items_center()
-            .justify_center()
-            .text_color(theme.text_muted)
-            .child("Loading...")
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(theme.text_muted)
+                    .child("⏳")
+                    .child("Loading stories…"),
+            )
+            .children(placeholders)
     }
 
     fn render_story_row(&self, story: &Story, cx: &mut ViewContext<Self>) -> impl IntoElement {
@@ -338,6 +464,7 @@ impl AppState {
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .line_height(rems(1.4))
+                            .whitespace_normal()
                             .child(title),
                     )
                     // Meta row
@@ -367,9 +494,11 @@ impl AppState {
         text_secondary: Hsla,
     ) -> impl IntoElement {
         div()
+            .min_w(px(0.))
             .flex()
             .flex_row()
             .items_center()
+            .flex_wrap()
             .gap_3()
             .text_xs()
             .text_color(text_muted)
@@ -463,6 +592,7 @@ impl AppState {
                         .text_sm()
                         .line_height(rems(1.6))
                         .text_color(text_primary)
+                        .whitespace_normal()
                         .child(clean_text),
                 )
             })
@@ -496,14 +626,18 @@ impl AppState {
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD)
                             .line_height(rems(1.4))
+                            .whitespace_normal()
                             .child(story.title.clone()),
                     )
                     // Meta
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
                             .flex()
                             .flex_row()
                             .items_center()
+                            .flex_wrap()
                             .gap_4()
                             .text_sm()
                             // Score
@@ -546,6 +680,82 @@ impl AppState {
             )
     }
 
+    fn render_comments_loading_indicator(&self) -> Div {
+        let theme = &self.theme;
+
+        let skeleton_bar = |max_w: f32, h: f32| {
+            div()
+                .h(px(h))
+                .w_full()
+                .max_w(px(max_w))
+                .rounded(px(3.))
+                .bg(theme.bg_tertiary)
+        };
+
+        let placeholders: Vec<_> = (0..6)
+            .map(|i| {
+                let indent = (i.min(2) * 16) as f32;
+                let line_1 = match i % 3 {
+                    0 => 360.0,
+                    1 => 300.0,
+                    _ => 260.0,
+                };
+
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .pl(px(indent))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .py_2()
+                            .px_3()
+                            .bg(theme.bg_secondary)
+                            .border_l_2()
+                            .border_color(theme.border_subtle)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(skeleton_bar(140.0, 10.0))
+                                    .child(skeleton_bar(line_1, 10.0))
+                                    .child(skeleton_bar(240.0, 10.0)),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .w_full()
+            .py_8()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_4()
+            .text_color(theme.text_muted)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child("💬")
+                    .child("Loading comments…"),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(placeholders),
+            )
+    }
+
     fn render_comments_section(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let theme = &self.theme;
 
@@ -555,7 +765,7 @@ impl AppState {
             .flex()
             .flex_col()
             .p_6()
-            .overflow_hidden()
+            .overflow_x_hidden()
             // Comments header
             .child(
                 div()
@@ -575,13 +785,7 @@ impl AppState {
             )
             // Comments list or loading
             .child(if self.is_loading_comments {
-                div()
-                    .w_full()
-                    .py_8()
-                    .flex()
-                    .justify_center()
-                    .text_color(theme.text_muted)
-                    .child("Loading comments...")
+                self.render_comments_loading_indicator()
             } else if self.comments.is_empty() {
                 div()
                     .w_full()
@@ -596,12 +800,15 @@ impl AppState {
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .overflow_hidden()
+                    .gap_2()
+                    .p_2()
+                    .bg(theme.bg_secondary)
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border_subtle)
                     .children(
-                        self.comments
-                            .iter()
-                            .filter(|c| !self.is_hidden_by_parent(c))
+                        self.visible_comments()
+                            .into_iter()
                             .map(|c| self.render_comment(c, cx)),
                     )
             })
@@ -632,70 +839,85 @@ impl AppState {
         let author = comment.author().to_string();
         let time = comment.formatted_time();
         let text = comment.clean_text();
-        let text_secondary = theme.text_secondary;
         let text_muted = theme.text_muted;
         let text_primary = theme.text_primary;
-        let bg_secondary = theme.bg_secondary;
+        let header_hover_bg = hsla(0., 0., 0.5, 0.06);
+        let collapse_label = if is_collapsed {
+            format!("▸ {}", reply_count)
+        } else {
+            format!("▾ {}", reply_count)
+        };
 
         div()
             .id(ElementId::Name(format!("comment-{}", comment_id).into()))
             .w_full()
             .min_w(px(0.))
+            .flex_shrink_0()
             .pl(px(indent))
-            .overflow_hidden()
             .child(
                 div()
                     .w_full()
                     .min_w(px(0.))
-                    .py_2()
-                    .px_3()
-                    .bg(bg_secondary)
-                    .border_l_2()
-                    .border_color(border_color)
-                    .overflow_hidden()
+                    .relative()
+                    .bg(theme.bg_primary)
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border_subtle)
+                    .shadow_sm()
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(border_color)
+                            .rounded_l_md(),
+                    )
                     .child(
                         div()
                             .w_full()
                             .min_w(px(0.))
+                            .py_2()
+                            .px_3()
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .overflow_hidden()
                             // Author, time, and collapse button
                             .child(
                                 div()
+                                    .id(ElementId::Name(
+                                        format!("comment-header-{}", comment_id).into(),
+                                    ))
+                                    .min_w(px(0.))
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap_2()
                                     .text_xs()
-                                    // Collapse/Expand button
                                     .when(has_replies, |this| {
+                                        this.cursor_pointer()
+                                            .rounded(px(3.))
+                                            .px_1()
+                                            .hover(move |s| s.bg(header_hover_bg))
+                                            .on_click(cx.listener(move |this, _event, cx| {
+                                                this.toggle_collapse(comment_id, cx);
+                                            }))
+                                    })
+                                    .when(has_replies, move |this| {
                                         this.child(
                                             div()
                                                 .id(ElementId::Name(
                                                     format!("collapse-{}", comment_id).into(),
                                                 ))
-                                                .cursor_pointer()
-                                                .px_1()
-                                                .rounded(px(2.))
                                                 .text_color(text_muted)
-                                                .hover(|s| s.bg(hsla(0., 0., 0.5, 0.1)))
-                                                .on_click(cx.listener(
-                                                    move |this, _event, cx| {
-                                                        this.toggle_collapse(comment_id, cx);
-                                                    },
-                                                ))
-                                                .child(if is_collapsed {
-                                                    format!("[+{}]", reply_count)
-                                                } else {
-                                                    "[-]".to_string()
-                                                }),
+                                                .child(collapse_label),
                                         )
                                     })
                                     .child(
                                         div()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(text_secondary)
+                                            .text_color(text_primary)
                                             .child(author),
                                     )
                                     .child(div().text_color(text_muted).child(time)),
@@ -709,7 +931,8 @@ impl AppState {
                                         .text_sm()
                                         .line_height(rems(1.5))
                                         .text_color(text_primary)
-                                        .overflow_hidden()
+                                        .whitespace_normal()
+                                        .overflow_x_hidden()
                                         .child(text),
                                 )
                             }),
