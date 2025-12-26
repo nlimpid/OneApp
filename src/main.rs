@@ -1,18 +1,25 @@
 mod api;
 mod models;
+mod reader;
+mod reader_view;
 mod theme;
 
+#[cfg(test)]
+mod scroll_tests;
+
 use api::HackerNewsClient;
+use gpui::http_client::HttpClient;
 use gpui::prelude::*;
 use gpui::{
-    div, hsla, point, px, rems, size, App, AppContext, AsyncWindowContext, Bounds, Div, ElementId,
-    FocusHandle, FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, Stateful, TitlebarOptions, ViewContext, WeakView, WindowBounds,
-    WindowOptions,
+    div, hsla, point, px, rems, size, AnyElement, App, AppContext, AsyncWindowContext, Bounds,
+    Div, ElementId, FocusHandle, FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, Stateful, TitlebarOptions,
+    ViewContext, WeakView, WindowBounds, WindowOptions, ScrollHandle,
 };
 use models::{Comment, NewsChannel, Story};
+use reader::{ReaderLoadState, ReaderSession};
 use reqwest_client::ReqwestClient;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use theme::Theme;
 
@@ -23,6 +30,7 @@ const STORY_LIST_DEFAULT_WIDTH: f32 = 360.0;
 const STORY_LIST_MIN_WIDTH: f32 = 240.0;
 const STORY_LIST_MIN_DETAIL_WIDTH: f32 = 360.0;
 const SPLITTER_WIDTH: f32 = 8.0;
+const READER_CACHE_MAX_ENTRIES: usize = 32;
 
 // Application State
 struct AppState {
@@ -35,7 +43,13 @@ struct AppState {
     is_loading_comments: bool,
     error_message: Option<String>,
     selected_channel: NewsChannel,
+    http_client: Arc<dyn HttpClient>,
     client: Arc<HackerNewsClient>,
+    reader: Option<ReaderSession>,
+    reader_cache: HashMap<String, reader::ReaderArticle>,
+    reader_cache_order: VecDeque<String>,
+    reader_scroll_handle: ScrollHandle,
+    debug_reader_scroll: bool,
     focus_handle: FocusHandle,
     story_list_width: f32,
     is_resizing_story_list: bool,
@@ -47,6 +61,7 @@ impl AppState {
     fn new(cx: &mut ViewContext<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let http_client = cx.app().http_client();
+        let debug_reader_scroll = std::env::var_os("ONEAPP_DEBUG_READER_SCROLL").is_some();
         Self {
             theme: Theme::default(),
             stories: Vec::new(),
@@ -57,7 +72,13 @@ impl AppState {
             is_loading_comments: false,
             error_message: None,
             selected_channel: NewsChannel::HackerNews,
+            http_client: http_client.clone(),
             client: Arc::new(HackerNewsClient::new(http_client)),
+            reader: None,
+            reader_cache: HashMap::new(),
+            reader_cache_order: VecDeque::new(),
+            reader_scroll_handle: ScrollHandle::new(),
+            debug_reader_scroll,
             focus_handle,
             story_list_width: STORY_LIST_DEFAULT_WIDTH,
             is_resizing_story_list: false,
@@ -69,6 +90,28 @@ impl AppState {
     fn selected_story(&self) -> Option<&Story> {
         self.selected_story_id
             .and_then(|id| self.stories.iter().find(|s| s.id == id))
+    }
+
+    fn cached_reader_article(&mut self, url: &str) -> Option<reader::ReaderArticle> {
+        let article = self.reader_cache.get(url).cloned()?;
+        self.touch_reader_cache(url);
+        Some(article)
+    }
+
+    fn cache_reader_article(&mut self, url: String, article: reader::ReaderArticle) {
+        self.reader_cache.insert(url.clone(), article);
+        self.touch_reader_cache(&url);
+
+        while self.reader_cache_order.len() > READER_CACHE_MAX_ENTRIES {
+            if let Some(evicted) = self.reader_cache_order.pop_front() {
+                self.reader_cache.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch_reader_cache(&mut self, url: &str) {
+        self.reader_cache_order.retain(|u| u != url);
+        self.reader_cache_order.push_back(url.to_string());
     }
 
     fn toggle_collapse(&mut self, comment_id: i64, cx: &mut ViewContext<Self>) {
@@ -135,6 +178,7 @@ impl AppState {
     }
 
     fn select_story(&mut self, story_id: i64, cx: &mut ViewContext<Self>) {
+        self.reader = None;
         let story = self.stories.iter().find(|s| s.id == story_id).cloned();
 
         if let Some(story) = story {
@@ -546,7 +590,9 @@ impl AppState {
             .overflow_hidden()
             // Titlebar spacer
             .child(div().h(px(TITLEBAR_HEIGHT)).w_full().flex_shrink_0())
-            .child(if let Some(story) = self.selected_story() {
+            .child(if let Some(reader) = self.reader.as_ref() {
+                self.render_reader_page(reader, cx).into_any_element()
+            } else if let Some(story) = self.selected_story() {
                 self.render_story_detail(story, cx).into_any_element()
             } else {
                 self.render_empty_state().into_any_element()
@@ -563,6 +609,365 @@ impl AppState {
             .justify_center()
             .text_color(theme.text_muted)
             .child("Select a story to read")
+    }
+
+    fn open_reader(&mut self, url: String, title_hint: Option<String>, cx: &mut ViewContext<Self>) {
+        self.reader_scroll_handle.set_offset(point(px(0.), px(0.)));
+
+        if let Some(article) = self.cached_reader_article(&url) {
+            self.reader = Some(ReaderSession {
+                url,
+                title_hint,
+                state: ReaderLoadState::Ready(article),
+            });
+            cx.notify();
+            return;
+        }
+
+        self.reader = Some(ReaderSession {
+            url: url.clone(),
+            title_hint: title_hint.clone(),
+            state: ReaderLoadState::Loading,
+        });
+        cx.notify();
+
+        let http_client = self.http_client.clone();
+
+        cx.spawn(
+            |this: WeakView<Self>, mut cx: AsyncWindowContext| async move {
+                let result = reader::load_article(http_client, &url, title_hint.as_deref()).await;
+                let _ = this.update(&mut cx, |this: &mut Self, cx: &mut ViewContext<Self>| {
+                    let Some(session) = this.reader.as_mut() else {
+                        return;
+                    };
+                    if session.url != url {
+                        return;
+                    }
+
+                    match result {
+                        Ok(article) => {
+                            session.state = ReaderLoadState::Ready(article.clone());
+                            this.cache_reader_article(url.clone(), article);
+                        }
+                        Err(message) => session.state = ReaderLoadState::Error(message),
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    fn close_reader(&mut self, cx: &mut ViewContext<Self>) {
+        self.reader = None;
+        cx.notify();
+    }
+
+    fn render_reader_page(
+        &self,
+        reader: &ReaderSession,
+        cx: &mut ViewContext<Self>,
+    ) -> impl IntoElement {
+        let theme = &self.theme;
+        let text_secondary = theme.text_secondary;
+        let text_primary = theme.text_primary;
+        let accent = theme.accent;
+        let accent_hover = theme.accent_hover;
+        let url = reader.url.clone();
+        let debug_reader_scroll = self.debug_reader_scroll;
+        let scroll_debug = debug_reader_scroll.then(|| {
+            let offset_y = self.reader_scroll_handle.offset().y;
+            let viewport_h = self.reader_scroll_handle.bounds().size.height;
+            let content_h = self
+                .reader_scroll_handle
+                .bounds_for_item(0)
+                .map(|b| b.size.height)
+                .unwrap_or_else(|| px(0.));
+            let max_scroll = (content_h - viewport_h).max(px(0.));
+            format!(
+                "y:{:.0} max:{:.0} children:{}",
+                offset_y.0,
+                max_scroll.0,
+                self.reader_scroll_handle.children_count()
+            )
+        });
+
+        let title = match &reader.state {
+            ReaderLoadState::Ready(article) if !article.title.is_empty() => article.title.clone(),
+            _ => reader.title_hint.clone().unwrap_or_else(|| url.clone()),
+        };
+
+        let content = match &reader.state {
+            ReaderLoadState::Loading => self.render_reader_loading().into_any_element(),
+            ReaderLoadState::Error(message) => self
+                .render_reader_error(message, reader, cx)
+                .into_any_element(),
+            ReaderLoadState::Ready(article) => {
+                self.render_reader_article(article).into_any_element()
+            }
+        };
+
+        div()
+            .id("reader-page")
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .p_6()
+                    .bg(theme.bg_secondary)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .id("reader-back")
+                                            .cursor_pointer()
+                                            .text_color(text_secondary)
+                                            .hover(move |s| s.text_color(text_primary))
+                                            .on_click(cx.listener(|this, _event, cx| {
+                                                this.close_reader(cx);
+                                            }))
+                                            .child("← Back"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .text_sm()
+                                            .text_color(theme.text_muted)
+                                            .overflow_hidden()
+                                            .child(title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .when_some(scroll_debug, |this, debug| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child(debug),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("reader-open-external")
+                                            .cursor_pointer()
+                                            .text_color(accent)
+                                            .hover(move |s| s.text_color(accent_hover))
+                                            .on_click(cx.listener(move |_this, _event, _cx| {
+                                                let _ = open::that(&url);
+                                            }))
+                                            .child("Open in Browser ↗"),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(content)
+    }
+
+    fn render_reader_loading(&self) -> impl IntoElement {
+        let theme = &self.theme;
+
+        let skeleton_bar = |max_w: f32, h: f32| {
+            div()
+                .h(px(h))
+                .w_full()
+                .max_w(px(max_w))
+                .rounded(px(3.))
+                .bg(theme.bg_tertiary)
+        };
+
+        let placeholders: Vec<_> = (0..10)
+            .map(|i| {
+                let line_w = match i % 4 {
+                    0 => 640.0,
+                    1 => 720.0,
+                    2 => 680.0,
+                    _ => 560.0,
+                };
+                skeleton_bar(line_w, 12.0).into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("reader-loading-scroll")
+            .flex_1()
+            .w_full()
+            .overflow_y_scroll()
+            .child(
+                div().w_full().flex().justify_center().child(
+                    div()
+                        .w_full()
+                        .max_w(px(760.))
+                        .px_8()
+                        .py_10()
+                        .flex()
+                        .flex_col()
+                        .gap_6()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_color(theme.text_muted)
+                                .child("⏳")
+                                .child("Loading article…"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .children(placeholders),
+                        ),
+                ),
+            )
+    }
+
+    fn render_reader_error(
+        &self,
+        message: &str,
+        reader: &ReaderSession,
+        cx: &mut ViewContext<Self>,
+    ) -> impl IntoElement {
+        let theme = &self.theme;
+        let accent_hover = theme.accent_hover;
+        let url = reader.url.clone();
+        let title_hint = reader.title_hint.clone();
+
+        div()
+            .flex_1()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(560.))
+                    .p_6()
+                    .bg(theme.bg_secondary)
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border_subtle)
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Couldn’t load this page"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.text_muted)
+                            .whitespace_normal()
+                            .child(message.to_string()),
+                    )
+                    .child(
+                        div().flex().items_center().gap_3().child(
+                            div()
+                                .id("reader-retry")
+                                .cursor_pointer()
+                                .rounded_md()
+                                .px_3()
+                                .py_2()
+                                .bg(theme.accent)
+                                .text_color(hsla(0., 0., 1., 1.0))
+                                .hover(move |s| s.bg(accent_hover))
+                                .on_click(cx.listener(move |this, _event, cx| {
+                                    this.open_reader(url.clone(), title_hint.clone(), cx);
+                                }))
+                                .child("Retry"),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_reader_block(&self, block: &reader::ReaderBlock) -> AnyElement {
+        reader_view::render_reader_block(&self.theme, block)
+    }
+
+    fn render_reader_article(&self, article: &reader::ReaderArticle) -> impl IntoElement {
+        let theme = &self.theme;
+
+        let meta = [
+            article.site_name.clone().unwrap_or_default(),
+            article.byline.clone().unwrap_or_default(),
+            article.reading_time.clone().unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+
+        div()
+            .id("reader-article-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.reader_scroll_handle)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(760.))
+                    .mx_auto()
+                    .px_8()
+                    .py_10()
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .line_height(rems(1.3))
+                                    .whitespace_normal()
+                                    .child(article.title.clone()),
+                            )
+                            .when(!meta.is_empty(), |this| {
+                                this.child(div().text_sm().text_color(theme.text_muted).child(meta))
+                            }),
+                    )
+                    .children(
+                        article
+                            .blocks
+                            .iter()
+                            .map(|block| self.render_reader_block(block))
+                            .collect::<Vec<_>>(),
+                    ),
+            )
     }
 
     fn render_story_detail(&self, story: &Story, cx: &mut ViewContext<Self>) -> impl IntoElement {
@@ -603,6 +1008,7 @@ impl AppState {
     fn render_story_header(&self, story: &Story, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let url = story.url.clone();
+        let title_hint = story.title.clone();
         let accent = theme.accent;
         let accent_hover = theme.accent_hover;
 
@@ -664,16 +1070,21 @@ impl AppState {
                             )
                             // Link
                             .when_some(url, |this: Div, url: String| {
+                                let title_hint = title_hint.clone();
                                 this.child(
                                     div()
                                         .id("open-link-btn")
                                         .cursor_pointer()
                                         .text_color(accent)
                                         .hover(move |s| s.text_color(accent_hover))
-                                        .on_click(cx.listener(move |_this, _event, _cx| {
-                                            let _ = open::that(&url);
+                                        .on_click(cx.listener(move |this, _event, cx| {
+                                            this.open_reader(
+                                                url.clone(),
+                                                Some(title_hint.clone()),
+                                                cx,
+                                            );
                                         }))
-                                        .child("Open Link ↗"),
+                                        .child("Read"),
                                 )
                             }),
                     ),
