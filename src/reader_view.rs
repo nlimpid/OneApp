@@ -85,10 +85,12 @@ pub(crate) fn render_reader_block(theme: &Theme, block: &reader::ReaderBlock) ->
         reader::ReaderBlock::Code { text, language } => {
             let mut container = div()
                 .w_full()
+                .min_w(px(0.))
                 .bg(theme.bg_secondary)
                 .rounded_md()
                 .border_1()
-                .border_color(theme.border_subtle);
+                .border_color(theme.border_subtle)
+                .overflow_hidden();
 
             if let Some(language) = language.clone().filter(|l| !l.is_empty()) {
                 container = container.child(
@@ -108,6 +110,7 @@ pub(crate) fn render_reader_block(theme: &Theme, block: &reader::ReaderBlock) ->
                 .child(
                     div()
                         .w_full()
+                        .min_w(px(0.))
                         .px_4()
                         .py_3()
                         .font_family("Menlo")
@@ -115,6 +118,7 @@ pub(crate) fn render_reader_block(theme: &Theme, block: &reader::ReaderBlock) ->
                         .line_height(rems(1.55))
                         .text_color(theme.text_primary)
                         .whitespace_normal()
+                        .overflow_x_hidden()
                         .child(text.clone()),
                 )
                 .into_any_element()

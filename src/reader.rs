@@ -19,16 +19,20 @@ const NEGATIVE_KEYWORDS: &[&str] = &[
     "ad",
     "ads",
     "advert",
+    "author-bio",
     "banner",
+    "breadcrumb",
     "cookie",
     "comment",
     "footer",
     "header",
     "masthead",
     "menu",
+    "meta-info",
     "modal",
     "nav",
     "newsletter",
+    "outbrain",
     "pagination",
     "popup",
     "promo",
@@ -39,6 +43,9 @@ const NEGATIVE_KEYWORDS: &[&str] = &[
     "social",
     "sponsor",
     "subscribe",
+    "tag",
+    "taboola",
+    "toc",
     "toolbar",
     "widget",
 ];
@@ -263,10 +270,31 @@ fn reader_cache_dir() -> Option<PathBuf> {
 }
 
 fn extract_html_article(html: &str, url: &url::Url, title_hint: Option<String>) -> ReaderArticle {
-    if let Some(article) = extract_with_readabilityrs(html, url, title_hint.clone()) {
-        return article;
-    }
+    let readability_article = extract_with_readabilityrs(html, url, title_hint.clone());
+    let fallback_article = extract_html_article_fallback(html, url, title_hint);
 
+    // Compare the two extraction methods and choose the one with more content
+    match readability_article {
+        Some(ra) => {
+            let ra_len = total_text_len(&ra.blocks);
+            let fb_len = total_text_len(&fallback_article.blocks);
+
+            // Use fallback if it has significantly more content (at least 20% more)
+            if fb_len > ra_len + ra_len / 5 {
+                fallback_article
+            } else {
+                ra
+            }
+        }
+        None => fallback_article,
+    }
+}
+
+fn extract_html_article_fallback(
+    html: &str,
+    url: &url::Url,
+    title_hint: Option<String>,
+) -> ReaderArticle {
     let doc = Html::parse_document(html);
 
     let title = extract_title(&doc).or(title_hint).unwrap_or_default();
@@ -306,7 +334,10 @@ fn extract_with_readabilityrs(
     let content_doc = Html::parse_fragment(&content_html);
     let root = content_doc.root_element();
     let blocks = extract_blocks(&root, url);
-    if blocks.is_empty() || total_text_len(&blocks) < 200 {
+
+    // Require at least 500 chars to consider readability extraction valid
+    // This helps avoid cases where only partial content is extracted
+    if blocks.is_empty() || total_text_len(&blocks) < 500 {
         return None;
     }
 

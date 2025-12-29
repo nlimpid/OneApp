@@ -648,6 +648,8 @@ impl AppState {
                         Ok(article) => {
                             session.state = ReaderLoadState::Ready(article.clone());
                             this.cache_reader_article(url.clone(), article);
+                            // Reset scroll position when article finishes loading
+                            this.reader_scroll_handle.set_offset(point(px(0.), px(0.)));
                         }
                         Err(message) => session.state = ReaderLoadState::Error(message),
                     }
@@ -719,6 +721,7 @@ impl AppState {
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .p_6()
                     .bg(theme.bg_secondary)
                     .border_b_1()
@@ -854,9 +857,14 @@ impl AppState {
         cx: &mut ViewContext<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
+        let accent = theme.accent;
         let accent_hover = theme.accent_hover;
         let url = reader.url.clone();
+        let url_for_open = reader.url.clone();
         let title_hint = reader.title_hint.clone();
+
+        // Convert technical error messages to user-friendly descriptions
+        let (friendly_title, friendly_message, suggestion) = Self::parse_error_message(message);
 
         div()
             .flex_1()
@@ -867,46 +875,181 @@ impl AppState {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(560.))
-                    .p_6()
+                    .max_w(px(480.))
+                    .p_8()
                     .bg(theme.bg_secondary)
-                    .rounded_lg()
+                    .rounded_xl()
                     .border_1()
                     .border_color(theme.border_subtle)
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .items_center()
+                    .gap_5()
+                    // Error icon
                     .child(
                         div()
-                            .text_base()
+                            .w(px(64.))
+                            .h(px(64.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(hsla(0., 0.8, 0.95, 1.0))
+                            .text_2xl()
+                            .child("⚠️"),
+                    )
+                    // Title
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Couldn’t load this page"),
+                            .child(friendly_title),
                     )
+                    // Description
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .whitespace_normal()
-                            .child(message.to_string()),
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.text_secondary)
+                                    .whitespace_normal()
+                                    .child(friendly_message),
+                            )
+                            .when_some(suggestion, |this, suggestion| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.text_muted)
+                                        .whitespace_normal()
+                                        .child(suggestion),
+                                )
+                            }),
                     )
+                    // URL display
                     .child(
-                        div().flex().items_center().gap_3().child(
-                            div()
-                                .id("reader-retry")
-                                .cursor_pointer()
-                                .rounded_md()
-                                .px_3()
-                                .py_2()
-                                .bg(theme.accent)
-                                .text_color(hsla(0., 0., 1., 1.0))
-                                .hover(move |s| s.bg(accent_hover))
-                                .on_click(cx.listener(move |this, _event, cx| {
-                                    this.open_reader(url.clone(), title_hint.clone(), cx);
-                                }))
-                                .child("Retry"),
-                        ),
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .bg(theme.bg_tertiary)
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(reader.url.clone()),
+                    )
+                    // Action buttons
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id("reader-retry")
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(theme.accent)
+                                    .text_color(hsla(0., 0., 1., 1.0))
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .hover(move |s| s.bg(accent_hover))
+                                    .on_click(cx.listener(move |this, _event, cx| {
+                                        this.open_reader(url.clone(), title_hint.clone(), cx);
+                                    }))
+                                    .child("Try Again"),
+                            )
+                            .child(
+                                div()
+                                    .id("reader-open-browser")
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .px_4()
+                                    .py_2()
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_color(accent)
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .hover(move |s| s.bg(theme.bg_hover))
+                                    .on_click(cx.listener(move |_this, _event, _cx| {
+                                        let _ = open::that(&url_for_open);
+                                    }))
+                                    .child("Open in Browser"),
+                            ),
                     ),
             )
+    }
+
+    fn parse_error_message(message: &str) -> (String, String, Option<String>) {
+        let msg_lower = message.to_lowercase();
+
+        if msg_lower.contains("error sending request") || msg_lower.contains("connection") {
+            (
+                "Unable to connect".to_string(),
+                "The page couldn't be reached. This might be a network issue or the website may be unavailable.".to_string(),
+                Some("Check your internet connection and try again.".to_string()),
+            )
+        } else if msg_lower.contains("timeout") {
+            (
+                "Request timed out".to_string(),
+                "The server took too long to respond.".to_string(),
+                Some("The website might be experiencing high traffic. Try again later.".to_string()),
+            )
+        } else if msg_lower.contains("http 404") {
+            (
+                "Page not found".to_string(),
+                "The requested page doesn't exist or has been moved.".to_string(),
+                None,
+            )
+        } else if msg_lower.contains("http 403") {
+            (
+                "Access denied".to_string(),
+                "You don't have permission to view this page.".to_string(),
+                Some("Try opening it in your browser instead.".to_string()),
+            )
+        } else if msg_lower.contains("http 5") {
+            (
+                "Server error".to_string(),
+                "The website is experiencing technical difficulties.".to_string(),
+                Some("Try again later or open in browser.".to_string()),
+            )
+        } else if msg_lower.contains("unsupported content type") {
+            (
+                "Unsupported content".to_string(),
+                "This type of content can't be displayed in reader mode.".to_string(),
+                Some("Try opening it in your browser instead.".to_string()),
+            )
+        } else if msg_lower.contains("invalid url") {
+            (
+                "Invalid URL".to_string(),
+                "The link appears to be malformed or invalid.".to_string(),
+                None,
+            )
+        } else if msg_lower.contains("too large") {
+            (
+                "Page too large".to_string(),
+                "This page is too large to load in reader mode.".to_string(),
+                Some("Try opening it in your browser instead.".to_string()),
+            )
+        } else {
+            (
+                "Couldn't load this page".to_string(),
+                message.to_string(),
+                Some("Try opening it in your browser instead.".to_string()),
+            )
+        }
     }
 
     fn render_reader_block(&self, block: &reader::ReaderBlock) -> AnyElement {
@@ -931,41 +1074,54 @@ impl AppState {
             .flex_1()
             .min_h(px(0.))
             .w_full()
+            .min_w(px(0.))
             .overflow_y_scroll()
+            .overflow_x_hidden()
             .track_scroll(&self.reader_scroll_handle)
             .child(
                 div()
                     .w_full()
-                    .max_w(px(760.))
-                    .mx_auto()
-                    .px_8()
-                    .py_10()
+                    .min_w(px(0.))
                     .flex()
-                    .flex_col()
-                    .gap_6()
+                    .justify_center()
+                    .overflow_hidden()
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .max_w(px(760.))
+                            .px_8()
+                            .py_10()
                             .flex()
                             .flex_col()
-                            .gap_2()
+                            .gap_6()
+                            .overflow_hidden()
                             .child(
                                 div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .line_height(rems(1.3))
-                                    .whitespace_normal()
-                                    .child(article.title.clone()),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .line_height(rems(1.3))
+                                            .whitespace_normal()
+                                            .child(article.title.clone()),
+                                    )
+                                    .when(!meta.is_empty(), |this| {
+                                        this.child(
+                                            div().text_sm().text_color(theme.text_muted).child(meta),
+                                        )
+                                    }),
                             )
-                            .when(!meta.is_empty(), |this| {
-                                this.child(div().text_sm().text_color(theme.text_muted).child(meta))
-                            }),
-                    )
-                    .children(
-                        article
-                            .blocks
-                            .iter()
-                            .map(|block| self.render_reader_block(block))
-                            .collect::<Vec<_>>(),
+                            .children(
+                                article
+                                    .blocks
+                                    .iter()
+                                    .map(|block| self.render_reader_block(block))
+                                    .collect::<Vec<_>>(),
+                            ),
                     ),
             )
     }

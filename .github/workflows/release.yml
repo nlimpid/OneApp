@@ -17,6 +17,9 @@ jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_MACOS_SIGNING_SECRETS: ${{ secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' }}
+      HAS_MACOS_NOTARIZATION_SECRETS: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +80,7 @@ jobs:
         run: cargo bundle --release
 
       - name: Import signing certificate (macOS)
-        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != ''
+        if: startsWith(matrix.os, 'macos') && env.HAS_MACOS_SIGNING_SECRETS == 'true'
         env:
           MACOS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
           MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
@@ -90,7 +93,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
 
       - name: Codesign (.app, macOS)
-        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != ''
+        if: startsWith(matrix.os, 'macos') && env.HAS_MACOS_SIGNING_SECRETS == 'true'
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
@@ -98,7 +101,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "target/bundle/osx/OneApp.app"
 
       - name: Notarize (.app, macOS)
-        if: startsWith(matrix.os, 'macos') && secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != ''
+        if: startsWith(matrix.os, 'macos') && env.HAS_MACOS_SIGNING_SECRETS == 'true' && env.HAS_MACOS_NOTARIZATION_SECRETS == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
